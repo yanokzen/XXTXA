@@ -1,0 +1,506 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { 
+  Undo, Redo, RefreshCcw, Trash2, Upload, Download, 
+  ArrowRight, ArrowLeft, CheckCircle2, ArrowLeftRight 
+} from 'lucide-react';
+
+/**
+ * FengShui Analyzer Pro
+ * 사실: 배치도 및 평면도 분석을 위한 React 기반 도구
+ * 견해: 풍수 분석의 정확도를 높이기 위해 무게중심 기반의 방위 배치를 구현함
+ */
+const App = () => {
+  // --- 공통 상태 ---
+  const [currentStep, setCurrentStep] = useState(1);
+
+  // --- STEP 1 상태 (배치도) ---
+  const [siteImage, setSiteImage] = useState(null);
+  const [siteImgEl, setSiteImgEl] = useState(null);
+  const [sitePoints, setSitePoints] = useState([]); 
+  const [siteHistory, setSiteHistory] = useState([[]]);
+  const [siteHistoryStep, setSiteHistoryStep] = useState(0);
+  const [siteTransform, setSiteTransform] = useState({ x: 0, y: 0, scale: 1 });
+  const [siteRotation, setSiteRotation] = useState(180); 
+  const [isFlipped, setIsFlipped] = useState(false);
+
+  // --- STEP 2 상태 (평면도) ---
+  const [floorImage, setFloorImage] = useState(null);
+  const [floorImgEl, setFloorImgEl] = useState(null);
+  const [floorPoints, setFloorPoints] = useState([]);
+  const [floorHistory, setFloorHistory] = useState([[]]);
+  const [floorHistoryStep, setFloorHistoryStep] = useState(0);
+  const [floorTransform, setFloorTransform] = useState({ x: 0, y: 0, scale: 1 });
+  const [centroid, setCentroid] = useState(null);
+  const [activeBearing, setActiveBearing] = useState(180); 
+
+  const dragInfo = useRef({ isDragging: false, targetIdx: null, startPos: { x: 0, y: 0 }, lastDist: 0, hasMoved: false });
+  const siteCanvasRef = useRef(null);
+  const floorCanvasRef = useRef(null);
+  const fileInputSiteRef = useRef(null);
+  const fileInputFloorRef = useRef(null);
+
+  const dirLabels = ['북', '북동', '동', '남동', '남', '남서', '서', '북서'];
+  const dirHanja = ['三', '五', '一', '九', '四', '二', '六', '七'];
+  const centerHanja = '八'; 
+  const dirAngles = [0, 45, 90, 135, 180, 225, 270, 315];
+
+  const MINT_COLOR = '#2dd4bf';
+  const GLOBAL_LINE_WIDTH = 2.0;
+
+  // --- 유틸리티 함수 ---
+  const isInvalidCoord = (x, y) => isNaN(x) || isNaN(y) || !isFinite(x) || !isFinite(y);
+
+  const drawRoundedRect = (ctx, x, y, width, height, radius) => {
+    if (isInvalidCoord(x, y) || isInvalidCoord(width, height)) return;
+    const r = Math.max(0, radius || 0);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + width - r, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+    ctx.lineTo(x + width, y + height - r);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+    ctx.lineTo(x + r, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  };
+
+  const getDirectionName = (deg) => {
+    const d = isNaN(deg) ? 0 : deg;
+    const normalized = (d + 360) % 360;
+    const idx = Math.round(normalized / 45) % 8;
+    return dirLabels[idx];
+  };
+
+  const calculateCentroid = (pts) => {
+    if (!pts || pts.length < 3) return null;
+    let area = 0, cx = 0, cy = 0;
+    for (let i = 0; i < pts.length; i++) {
+      let j = (i + 1) % pts.length;
+      let f = (pts[i].x * pts[j].y - pts[j].x * pts[i].y);
+      area += f; cx += (pts[i].x + pts[j].x) * f; cy += (pts[i].y + pts[j].y) * f;
+    }
+    const finalArea = area / 2;
+    if (Math.abs(finalArea) < 0.1) return null;
+    return { x: cx / (6 * finalArea), y: cy / (6 * finalArea) };
+  };
+
+  const getCanvasCoords = (e, canvas, transform) => {
+    if (!canvas || !transform) return { imgX: 0, imgY: 0, rawX: 0, rawY: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const x = (clientX - rect.left) * (canvas.width / rect.width);
+    const y = (clientY - rect.top) * (canvas.height / rect.height);
+    const scale = transform.scale || 1;
+    return { 
+      imgX: (x - transform.x) / scale, 
+      imgY: (y - transform.y) / scale, 
+      rawX: clientX, 
+      rawY: clientY 
+    };
+  };
+
+  const getBoundaryPoint = (cx, cy, screenAngle, width, height, padding = 0) => {
+    if (isInvalidCoord(cx, cy)) return { x: 0, y: 0 };
+    const rad = screenAngle * Math.PI / 180;
+    const cos = Math.cos(rad); const sin = Math.sin(rad);
+    let tValues = [];
+    if (cos > 0) tValues.push((width - padding - cx) / cos); else if (cos < 0) tValues.push((padding - cx) / cos);
+    if (sin > 0) tValues.push((height - padding - cy) / sin); else if (sin < 0) tValues.push((padding - cy) / sin);
+    const t = Math.min(...tValues.filter(v => v > 0)) || 0;
+    return { x: cx + t * cos, y: cy + t * sin };
+  };
+
+  const drawLabel = (ctx, text, x, y, baseFontSize, colorMode = 'normal') => {
+    if (isInvalidCoord(x, y) || isNaN(baseFontSize)) return;
+    ctx.font = `bold ${baseFontSize}px sans-serif`;
+    const metrics = ctx.measureText(text);
+    const pH = baseFontSize * 0.6; const pV = baseFontSize * 0.35;
+    const bw = metrics.width + pH * 2; const bh = baseFontSize + pV * 2;
+    
+    if (colorMode === 'primary') ctx.fillStyle = '#2563eb';
+    else if (colorMode === 'mint') ctx.fillStyle = MINT_COLOR;
+    else if (colorMode === 'orange') ctx.fillStyle = '#ef4444';
+    else ctx.fillStyle = '#fffae6';
+
+    drawRoundedRect(ctx, x - bw / 2, y - bh / 2, bw, bh, baseFontSize * 0.2);
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(1, baseFontSize * 0.05); ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y);
+  };
+
+  const drawHanjaMark = (ctx, hanja, x, y, fontSize, fontWeight = 'bold', showBg = true, textColor = '#000000') => {
+    if (isInvalidCoord(x, y) || isNaN(fontSize)) return;
+    if (showBg) {
+      const boxSize = fontSize * 1.4;
+      ctx.fillStyle = '#ffffff';
+      drawRoundedRect(ctx, x - boxSize / 2, y - boxSize / 2, boxSize, boxSize, fontSize * 0.2);
+      ctx.fill();
+      ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.font = `${fontWeight} ${fontSize}px serif`;
+    ctx.fillStyle = textColor;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(hanja, x, y);
+  };
+
+  const drawArrowHead = (ctx, fromX, fromY, toX, toY, size) => {
+    if (isInvalidCoord(fromX, fromY) || isInvalidCoord(toX, toY)) return;
+    const angle = Math.atan2(toY - fromY, toX - fromX);
+    ctx.beginPath(); ctx.moveTo(toX, toY);
+    ctx.lineTo(toX - size * Math.cos(angle - Math.PI / 6), toY - size * Math.sin(angle - Math.PI / 6));
+    ctx.lineTo(toX - size * Math.cos(angle + Math.PI / 6), toY - size * Math.sin(angle + Math.PI / 6));
+    ctx.closePath(); ctx.fill();
+  };
+
+  const centerImage = useCallback((img, setTransform, ref) => {
+    const container = ref.current?.parentElement;
+    if (!container || !img || img.width === 0) return;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    const scale = Math.min(cw / img.width, ch / img.height, 1) || 1;
+    setTransform({
+      x: (cw - img.width * scale) / 2,
+      y: (ch - img.height * scale) / 2,
+      scale: scale
+    });
+  }, []);
+
+  const saveHistory = (type, newPoints) => {
+    if (type === 'site') {
+      const newHist = siteHistory.slice(0, siteHistoryStep + 1);
+      newHist.push([...newPoints]);
+      setSiteHistory(newHist); setSiteHistoryStep(newHist.length - 1); setSitePoints([...newPoints]);
+    } else {
+      const newHist = floorHistory.slice(0, floorHistoryStep + 1);
+      newHist.push([...newPoints]);
+      setFloorHistory(newHist); setFloorHistoryStep(newHist.length - 1); setFloorPoints([...newPoints]);
+      setCentroid(calculateCentroid(newPoints));
+    }
+  };
+
+  const handleUndo = (type) => {
+    if (type === 'site' && siteHistoryStep > 0) {
+      const step = siteHistoryStep - 1; setSiteHistoryStep(step); setSitePoints(siteHistory[step]);
+    } else if (type === 'floor' && floorHistoryStep > 0) {
+      const step = floorHistoryStep - 1; setFloorHistoryStep(step); setFloorPoints(floorHistory[step]); setCentroid(calculateCentroid(floorHistory[step]));
+    }
+  };
+
+  const handleRedo = (type) => {
+    if (type === 'site' && siteHistoryStep < siteHistory.length - 1) {
+      const step = siteHistoryStep + 1; setSiteHistoryStep(step); setSitePoints(siteHistory[step]);
+    } else if (type === 'floor' && floorHistoryStep < floorHistory.length - 1) {
+      const step = floorHistoryStep + 1; setFloorHistoryStep(step); setFloorPoints(floorHistory[step]); setCentroid(calculateCentroid(floorHistory[step]));
+    }
+  };
+
+  const handleFileUpload = (e, type) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        if (type === 'site') {
+          setSiteImage(event.target.result); setSiteImgEl(img); setSitePoints([]); setSiteHistory([[]]); setSiteHistoryStep(0);
+          centerImage(img, setSiteTransform, siteCanvasRef);
+        } else {
+          setFloorImage(event.target.result); setFloorImgEl(img); setFloorPoints([]); setFloorHistory([[]]); setFloorHistoryStep(0); setCentroid(null); setActiveBearing(180);
+          centerImage(img, setFloorTransform, floorCanvasRef);
+        }
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  // --- 효과 ---
+  useEffect(() => {
+    if (currentStep === 1 && siteImgEl) centerImage(siteImgEl, setSiteTransform, siteCanvasRef);
+    if (currentStep === 2 && floorImgEl) centerImage(floorImgEl, setFloorTransform, floorCanvasRef);
+  }, [currentStep, siteImgEl, floorImgEl, centerImage]);
+
+  const handleDownloadFullImage = () => {
+    if (!floorImgEl || !centroid) return;
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = floorImgEl.width; offCanvas.height = floorImgEl.height;
+    const ctx = offCanvas.getContext('2d');
+    ctx.drawImage(floorImgEl, 0, 0);
+    if (floorPoints.length > 0) {
+      ctx.beginPath(); ctx.moveTo(floorPoints[0].x, floorPoints[0].y);
+      floorPoints.forEach(p => ctx.lineTo(p.x, p.y)); ctx.closePath();
+      ctx.strokeStyle = '#f43f5e'; ctx.lineWidth = Math.max(4, offCanvas.width * 0.005); ctx.stroke();
+    }
+    const fs = Math.max(20, offCanvas.width * 0.022);
+    const scx = centroid.x; const scy = centroid.y;
+    const anchorBase = 90;
+    const baseLW = GLOBAL_LINE_WIDTH * (offCanvas.width / 800);
+
+    dirAngles.forEach((angle) => {
+      const boundaryAngle = anchorBase + (angle + 22.5 - activeBearing);
+      const bp = getBoundaryPoint(scx, scy, boundaryAngle, offCanvas.width, offCanvas.height, 0);
+      ctx.setLineDash([fs * 0.5, fs * 0.25]); ctx.strokeStyle = MINT_COLOR; ctx.lineWidth = baseLW;
+      ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(bp.x, bp.y); ctx.stroke();
+    });
+
+    const bpRedEnd = getBoundaryPoint(scx, scy, anchorBase, offCanvas.width, offCanvas.height, 0);
+    ctx.setLineDash([]); ctx.strokeStyle = '#ef4444'; ctx.lineWidth = baseLW;
+    ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(bpRedEnd.x, bpRedEnd.y); ctx.stroke();
+
+    const bpBlueEnd = getBoundaryPoint(scx, scy, anchorBase + 180, offCanvas.width, offCanvas.height, 0);
+    ctx.strokeStyle = '#2563eb'; ctx.lineWidth = baseLW;
+    ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(bpBlueEnd.x, bpBlueEnd.y); ctx.stroke();
+
+    ctx.fillStyle = '#2563eb';
+    ctx.beginPath(); ctx.arc(scx, scy, fs * 0.8, 0, Math.PI * 2); ctx.fill(); 
+    drawHanjaMark(ctx, centerHanja, scx, scy, fs * 1.0, '900', false, '#ffffff');
+
+    dirAngles.forEach((angle, idx) => {
+      const centerAngle = anchorBase + (angle - activeBearing);
+      const bpEnd = getBoundaryPoint(scx, scy, centerAngle, offCanvas.width, offCanvas.height, 0);
+      const midX = (scx + bpEnd.x) / 2; const midY = (scy + bpEnd.y) / 2;
+      drawLabel(ctx, `${dirLabels[idx]} ${Math.round((angle + 360) % 360)}°`, midX, midY - 12, fs * 0.5, 'mint');
+      drawHanjaMark(ctx, dirHanja[idx], midX, midY + 14, fs * 0.8); 
+    });
+
+    offCanvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a'); link.href = url;
+      link.download = `FengShui_Analysis_${Date.now()}.png`;
+      document.body.appendChild(link); link.click(); document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 'image/png', 1.0);
+  };
+
+  const onStart = (e, type) => {
+    const canvas = type === 'site' ? siteCanvasRef.current : floorCanvasRef.current;
+    const transform = type === 'site' ? siteTransform : floorTransform;
+    const pts = type === 'site' ? sitePoints : floorPoints;
+    if (e.touches && e.touches.length === 2) {
+      dragInfo.current.lastDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      return;
+    }
+    const coords = getCanvasCoords(e, canvas, transform);
+    const hitIdx = pts.findIndex(p => Math.hypot(p.x - coords.imgX, p.y - coords.imgY) < 35 / transform.scale);
+    dragInfo.current = { isDragging: true, targetIdx: hitIdx !== -1 ? hitIdx : null, startPos: { x: coords.rawX, y: coords.rawY }, hasMoved: false };
+  };
+
+  const onMove = (e, type) => {
+    if (!dragInfo.current.isDragging) return;
+    const setT = type === 'site' ? setSiteTransform : setFloorTransform;
+    const pts = type === 'site' ? sitePoints : floorPoints;
+    const setP = type === 'site' ? setSitePoints : setFloorPoints;
+    const canvas = type === 'site' ? siteCanvasRef.current : floorCanvasRef.current;
+    const transform = type === 'site' ? siteTransform : floorTransform;
+
+    if (e.touches && e.touches.length === 2) {
+      const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      if (dragInfo.current.lastDist > 0) {
+        const factor = dist / dragInfo.current.lastDist;
+        setT(prev => ({ ...prev, scale: Math.min(Math.max(prev.scale * factor, 0.05), 15) }));
+      }
+      dragInfo.current.lastDist = dist; return;
+    }
+
+    const coords = getCanvasCoords(e, canvas, transform);
+    const dx = coords.rawX - dragInfo.current.startPos.x;
+    const dy = coords.rawY - dragInfo.current.startPos.y;
+    if (Math.hypot(dx, dy) > 3) dragInfo.current.hasMoved = true;
+
+    if (dragInfo.current.targetIdx !== null) {
+      const next = [...pts]; next[dragInfo.current.targetIdx] = { x: coords.imgX, y: coords.imgY }; setP(next);
+      if (type === 'floor' && pts.length >= 4) setCentroid(calculateCentroid(next));
+    } else {
+      setT(prev => ({ ...prev, x: prev.x + dx, y: prev.y + dy }));
+    }
+    dragInfo.current.startPos = { x: coords.rawX, y: coords.rawY };
+  };
+
+  const onEnd = (e, type) => {
+    if (dragInfo.current.isDragging && !dragInfo.current.hasMoved && dragInfo.current.targetIdx === null) {
+      const canvas = type === 'site' ? siteCanvasRef.current : floorCanvasRef.current;
+      const transform = type === 'site' ? siteTransform : floorTransform;
+      const coords = getCanvasCoords(e.changedTouches ? e.changedTouches[0] : e, canvas, transform);
+      if (isInvalidCoord(coords.imgX, coords.imgY)) return;
+      if (type === 'site' && sitePoints.length < 2) saveHistory('site', [...sitePoints, { x: coords.imgX, y: coords.imgY }]);
+      else if (type === 'floor') saveHistory('floor', [...floorPoints, { x: coords.imgX, y: coords.imgY }]);
+    } else if (dragInfo.current.hasMoved) saveHistory(type, type === 'site' ? sitePoints : floorPoints);
+    dragInfo.current.isDragging = false;
+  };
+
+  const handleWheel = (e, setTransform) => {
+    const factor = Math.pow(1.1, -e.deltaY / 120);
+    setTransform(prev => ({ ...prev, scale: Math.min(Math.max(prev.scale * factor, 0.05), 15) }));
+  };
+
+  useEffect(() => {
+    if (!sitePoints || sitePoints.length < 2) return;
+    const [p1, p2] = sitePoints;
+    const dx = p2.x - p1.x; const dy = p2.y - p1.y;
+    if (dx === 0 && dy === 0) return;
+    let nx = -dy, ny = dx;
+    if (isFlipped) { nx = -nx; ny = -ny; }
+    const angleRad = Math.atan2(nx, -ny);
+    const angleDeg = (angleRad * 180 / Math.PI);
+    setSiteRotation((angleDeg + 360) % 360);
+  }, [sitePoints, isFlipped]);
+
+  useEffect(() => {
+    if (!siteImgEl || !siteCanvasRef.current || currentStep !== 1) return;
+    const cvs = siteCanvasRef.current; const ctx = cvs.getContext('2d');
+    cvs.width = cvs.parentElement.clientWidth; cvs.height = cvs.parentElement.clientHeight;
+    const scale = siteTransform.scale || 1;
+    ctx.save(); ctx.translate(siteTransform.x, siteTransform.y); ctx.scale(scale, scale);
+    ctx.drawImage(siteImgEl, 0, 0);
+    if (sitePoints.length > 0) {
+      ctx.beginPath(); ctx.moveTo(sitePoints[0].x, sitePoints[0].y);
+      for(let i=1; i<sitePoints.length; i++) ctx.lineTo(sitePoints[i].x, sitePoints[i].y);
+      ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 3 / scale; ctx.stroke();
+      sitePoints.forEach(p => {
+        ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(p.x, p.y, 10 / scale, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'white'; ctx.lineWidth = 2 / scale; ctx.stroke();
+      });
+      if (sitePoints.length === 2) {
+        const mx = (sitePoints[0].x + sitePoints[1].x) / 2, my = (sitePoints[0].y + sitePoints[1].y) / 2;
+        const ang = (siteRotation - 90) * Math.PI / 180;
+        const ax = mx + Math.cos(ang) * (90 / scale), ay = my + Math.sin(ang) * (90 / scale);
+        ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(ax, ay); 
+        ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 4 / scale; ctx.stroke();
+        drawArrowHead(ctx, mx, my, ax, ay, 20 / scale);
+        drawLabel(ctx, `${getDirectionName(siteRotation)} (${Math.round(siteRotation)}°)`, ax, ay + 30/scale, 14 / scale, 'primary');
+      }
+    }
+    ctx.restore();
+  }, [siteImgEl, sitePoints, siteRotation, siteTransform, currentStep]);
+
+  useEffect(() => {
+    if (!floorImgEl || !floorCanvasRef.current || currentStep !== 2) return;
+    const cvs = floorCanvasRef.current; const ctx = cvs.getContext('2d');
+    cvs.width = cvs.parentElement.clientWidth; cvs.height = cvs.parentElement.clientHeight;
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+    const scale = floorTransform.scale || 1;
+    ctx.save(); ctx.translate(floorTransform.x, floorTransform.y); ctx.scale(scale, scale);
+    ctx.drawImage(floorImgEl, 0, 0);
+    if (floorPoints.length > 0) {
+      ctx.beginPath(); ctx.moveTo(floorPoints[0].x, floorPoints[0].y);
+      for(let i = 1; i < floorPoints.length; i++) ctx.lineTo(floorPoints[i].x, floorPoints[i].y);
+      if (floorPoints.length >= 4) ctx.closePath();
+      ctx.strokeStyle = '#f43f5e'; ctx.lineWidth = 4 / scale; ctx.stroke();
+      floorPoints.forEach(p => {
+        ctx.fillStyle = '#f43f5e'; ctx.beginPath(); ctx.arc(p.x, p.y, 10 / scale, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'white'; ctx.lineWidth = 2 / scale; ctx.stroke();
+      });
+    }
+    ctx.restore();
+
+    if (centroid && floorPoints.length >= 4) {
+      const scx = centroid.x * scale + floorTransform.x, scy = centroid.y * scale + floorTransform.y;
+      const anchorBase = 90;
+      dirAngles.forEach((angle) => {
+        const boundaryAngle = anchorBase + (angle + 22.5 - activeBearing);
+        const bp = getBoundaryPoint(scx, scy, boundaryAngle, cvs.width, cvs.height, 0);
+        ctx.setLineDash([8, 4]); ctx.strokeStyle = MINT_COLOR; ctx.lineWidth = GLOBAL_LINE_WIDTH;
+        ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(bp.x, bp.y); ctx.stroke();
+      });
+      ctx.setLineDash([]); ctx.fillStyle = '#2563eb'; 
+      ctx.beginPath(); ctx.arc(scx, scy, 11, 0, Math.PI * 2); ctx.fill(); 
+      drawHanjaMark(ctx, centerHanja, scx, scy, 14, '900', false, '#ffffff');
+      dirAngles.forEach((angle, idx) => {
+        const centerAngle = anchorBase + (angle - activeBearing);
+        const bpEnd = getBoundaryPoint(scx, scy, centerAngle, cvs.width, cvs.height, 0);
+        const midX = (scx + bpEnd.x) / 2; const midY = (scy + bpEnd.y) / 2;
+        drawLabel(ctx, `${dirLabels[idx]} ${Math.round((angle + 360) % 360)}°`, midX, midY - 12, 9, 'mint');
+        drawHanjaMark(ctx, dirHanja[idx], midX, midY + 14, 16); 
+      });
+    }
+  }, [floorImgEl, floorPoints, centroid, activeBearing, floorTransform, currentStep]);
+
+  return (
+    <div className="flex flex-col min-h-screen bg-slate-50 font-sans text-slate-900 select-none text-sm overflow-x-hidden">
+      <header className="bg-slate-900 text-white px-6 py-4 flex justify-between items-center shadow-lg sticky top-0 z-50">
+        <h1 className="font-bold text-lg tracking-tight text-blue-400">FengShui Analyzer Pro</h1>
+      </header>
+
+      <main className="flex-1 p-4 space-y-6 max-w-4xl mx-auto w-full pb-24">
+        {currentStep === 1 ? (
+          <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="p-4 border-b bg-slate-50 flex justify-between items-center">
+              <h2 className="font-bold text-slate-700">1. 거실향 산출 (배치도)</h2>
+              <div className="flex gap-2">
+                <button onClick={() => fileInputSiteRef.current.click()} className="p-2 bg-slate-800 text-white rounded-lg active:scale-95 transition"><Upload size={18} /></button>
+                <button onClick={() => setCurrentStep(2)} disabled={sitePoints.length < 2} className="p-2 bg-blue-600 text-white rounded-lg active:scale-95 transition disabled:opacity-30"><ArrowRight size={18} /></button>
+              </div>
+            </div>
+            <div className="h-96 relative bg-slate-100 touch-none overflow-hidden" onWheel={e => handleWheel(e, setSiteTransform)}>
+              {!siteImage ? ( 
+                <div className="absolute inset-0 flex items-center justify-center text-slate-400 text-xs px-12 text-center">배치도를 업로드하고 거실 창가 라인의 양 끝점을 찍으세요.</div> 
+              ) : (
+                <canvas ref={siteCanvasRef} onMouseDown={e => onStart(e, 'site')} onMouseMove={e => onMove(e, 'site')} onTouchStart={e => onStart(e, 'site')} onTouchMove={e => onMove(e, 'site')} onTouchEnd={e => onEnd(e, 'site')} onMouseUp={e => onEnd(e, 'site')} className="w-full h-full" />
+              )}
+            </div>
+            {siteImage && (
+              <div className="p-4 bg-slate-50 border-t flex justify-between items-center">
+                <div className="flex gap-2">
+                  <button onClick={() => handleUndo('site')} disabled={siteHistoryStep === 0} className="p-2 bg-white border rounded-lg disabled:opacity-30"><Undo size={16} /></button>
+                  <button onClick={() => handleRedo('site')} disabled={siteHistoryStep === siteHistory.length - 1} className="p-2 bg-white border rounded-lg disabled:opacity-30"><Redo size={16} /></button>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setIsFlipped(!isFlipped)} className="px-3 py-2 bg-blue-100 text-blue-700 font-bold rounded-lg flex items-center gap-2"><ArrowLeftRight size={16} /> 반전</button>
+                  <button onClick={() => {setSiteImage(null); setSitePoints([]);}} className="p-2 bg-rose-50 text-rose-600 rounded-lg"><Trash2 size={16} /></button>
+                </div>
+              </div>
+            )}
+            <input type="file" ref={fileInputSiteRef} onChange={e => handleFileUpload(e, 'site')} className="hidden" accept="image/*" />
+          </section>
+        ) : (
+          <section className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="p-4 border-b bg-slate-50 flex justify-between items-center">
+              <div className="flex items-center gap-2">
+                <button onClick={() => setCurrentStep(1)} className="p-2 bg-white border rounded-lg text-slate-500"><ArrowLeft size={16} /></button>
+                <h2 className="font-bold text-slate-700">2. 평면도 분석</h2>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => fileInputFloorRef.current.click()} className="p-2 bg-slate-800 text-white rounded-lg"><Upload size={18} /></button>
+                {floorImage && (
+                  <>
+                    <button onClick={() => setActiveBearing(siteRotation)} className="px-3 py-2 bg-indigo-600 text-white font-bold rounded-lg text-xs">향 적용</button>
+                    <button onClick={handleDownloadFullImage} disabled={floorPoints.length < 4} className="p-2 bg-emerald-600 text-white rounded-lg"><Download size={18} /></button>
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="h-[450px] relative bg-slate-100 touch-none overflow-hidden" onWheel={e => handleWheel(e, setFloorTransform)}>
+              {!floorImage ? ( 
+                <div className="absolute inset-0 flex items-center justify-center text-slate-400 text-xs px-12 text-center">평면도를 업로드하고 집 내부 모서리를 순서대로 찍으세요.</div> 
+              ) : (
+                <canvas ref={floorCanvasRef} onMouseDown={e => onStart(e, 'floor')} onMouseMove={e => onMove(e, 'floor')} onTouchStart={e => onStart(e, 'floor')} onTouchMove={e => onMove(e, 'floor')} onTouchEnd={e => onEnd(e, 'floor')} onMouseUp={e => onEnd(e, 'floor')} className="w-full h-full" />
+              )}
+            </div>
+            {floorImage && (
+              <div className="p-4 bg-slate-50 border-t flex justify-between items-center">
+                <div className="flex gap-2">
+                  <button onClick={() => handleUndo('floor')} disabled={floorHistoryStep === 0} className="p-2 bg-white border rounded-lg disabled:opacity-30"><Undo size={16} /></button>
+                  <button onClick={() => handleRedo('floor')} disabled={floorHistoryStep === floorHistory.length - 1} className="p-2 bg-white border rounded-lg disabled:opacity-30"><Redo size={16} /></button>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => {setFloorPoints([]); setCentroid(null);}} className="p-2 bg-white border rounded-lg text-slate-500"><RefreshCcw size={16} /></button>
+                  <button onClick={() => {setFloorImage(null); setFloorPoints([]);}} className="p-2 bg-rose-50 text-rose-600 rounded-lg"><Trash2 size={16} /></button>
+                </div>
+              </div>
+            )}
+            <input type="file" ref={fileInputFloorRef} onChange={e => handleFileUpload(e, 'floor')} className="hidden" accept="image/*" />
+          </section>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
